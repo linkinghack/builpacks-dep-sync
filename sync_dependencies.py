@@ -9,6 +9,8 @@ import json
 from urllib.parse import urlparse
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
 
 TASK_LOG_FILENAME = "task_log.json"
 TASK_STATUS_PENDING = "pending"
@@ -17,6 +19,9 @@ TASK_STATUS_DOWNLOADED = "downloaded"
 TASK_STATUS_UPLOADING = "uploading"
 TASK_STATUS_UPLOADED = "uploaded"
 TASK_STATUS_FAILED = "failed"
+
+DEFAULT_WORKERS = 4
+log_lock = threading.Lock()
 
 
 def parse_args():
@@ -179,50 +184,100 @@ def init_task_log(deps, temp_dir, registry):
     return log
 
 
-def update_task_status(log, uri, status, error=None):
-    for entry in log:
-        if entry['uri'] == uri:
-            entry['status'] = status
-            entry['error'] = error
-            break
+def thread_safe_update_task_status(log, uri, status, error=None):
+    with log_lock:
+        for entry in log:
+            if entry['uri'] == uri:
+                entry['status'] = status
+                entry['error'] = error
+                break
 
+def thread_safe_save_task_log(temp_dir, log):
+    with log_lock:
+        save_task_log(temp_dir, log)
 
-def download_and_upload_all(deps, temp_dir, registry, username=None, password=None):
+def download_worker(entry, temp_dir, log):
+    uri = entry['uri']
+    file_path = entry['file_path']
+    status = entry.get('status', TASK_STATUS_PENDING)
+    if status == TASK_STATUS_UPLOADED or status == TASK_STATUS_DOWNLOADED:
+        return
+    thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADING)
+    thread_safe_save_task_log(temp_dir, log)
+    try:
+        if not (os.path.exists(file_path) and os.path.getsize(file_path) > 0):
+            download_file(uri, temp_dir)
+        thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADED)
+    except Exception as e:
+        thread_safe_update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
+    thread_safe_save_task_log(temp_dir, log)
+
+def upload_worker(entry, registry, username, password, temp_dir, log):
+    uri = entry['uri']
+    file_path = entry['file_path']
+    status = entry.get('status', TASK_STATUS_DOWNLOADED)
+    if status == TASK_STATUS_UPLOADED:
+        return
+    if not os.path.exists(file_path):
+        return
+    thread_safe_update_task_status(log, uri, TASK_STATUS_UPLOADING)
+    thread_safe_save_task_log(temp_dir, log)
+    try:
+        push_with_curl(registry, file_path, username, password)
+        thread_safe_update_task_status(log, uri, TASK_STATUS_UPLOADED)
+    except Exception as e:
+        thread_safe_update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
+    thread_safe_save_task_log(temp_dir, log)
+
+def download_and_upload_all(deps, temp_dir, registry, username=None, password=None, max_workers=DEFAULT_WORKERS):
     log = load_task_log(temp_dir)
     if not log:
         log = init_task_log(deps, temp_dir, registry)
-    for entry in log:
+    upload_queue = Queue()
+    # 启动上传线程池
+    def upload_consumer():
+        while True:
+            try:
+                entry = upload_queue.get(timeout=3)
+            except Empty:
+                break
+            upload_worker(entry, registry, username, password, temp_dir, log)
+            upload_queue.task_done()
+    upload_threads = []
+    for _ in range(max_workers):
+        t = threading.Thread(target=upload_consumer)
+        t.daemon = True
+        t.start()
+        upload_threads.append(t)
+    # 启动下载线程池，下载完成即入上传队列
+    def download_and_enqueue(entry):
         uri = entry['uri']
         file_path = entry['file_path']
-        upload_url = entry['upload_url']
         status = entry.get('status', TASK_STATUS_PENDING)
-        # 跳过已上传
         if status == TASK_STATUS_UPLOADED:
-            continue
-        # 下载
-        if status in [TASK_STATUS_PENDING, TASK_STATUS_FAILED, TASK_STATUS_DOWNLOADING]:
-            update_task_status(log, uri, TASK_STATUS_DOWNLOADING)
-            save_task_log(temp_dir, log)
-            try:
-                # 若文件已存在且完整，跳过下载
-                if not (os.path.exists(file_path) and os.path.getsize(file_path) > 0):
-                    download_file(uri, temp_dir)
-                update_task_status(log, uri, TASK_STATUS_DOWNLOADED)
-            except Exception as e:
-                update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
-                save_task_log(temp_dir, log)
-                continue
-            save_task_log(temp_dir, log)
-        # 上传
-        if entry['status'] == TASK_STATUS_DOWNLOADED:
-            update_task_status(log, uri, TASK_STATUS_UPLOADING)
-            save_task_log(temp_dir, log)
-            try:
-                push_with_curl(registry, file_path, username, password)
-                update_task_status(log, uri, TASK_STATUS_UPLOADED)
-            except Exception as e:
-                update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
-            save_task_log(temp_dir, log)
+            return
+        if status == TASK_STATUS_DOWNLOADED:
+            # 已下载未上传的，直接入队
+            upload_queue.put(entry)
+            return
+        thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADING)
+        thread_safe_save_task_log(temp_dir, log)
+        try:
+            if not (os.path.exists(file_path) and os.path.getsize(file_path) > 0):
+                download_file(uri, temp_dir)
+            thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADED)
+            thread_safe_save_task_log(temp_dir, log)
+            upload_queue.put(entry)
+        except Exception as e:
+            thread_safe_update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
+            thread_safe_save_task_log(temp_dir, log)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(download_and_enqueue, entry)
+                   for entry in log if entry.get('status') not in [TASK_STATUS_UPLOADED]]
+        for f in as_completed(futures):
+            pass
+    # 等待所有上传完成
+    upload_queue.join()
 
 def main():
     args = parse_args()
@@ -247,15 +302,15 @@ def main():
             status = entry.get('status', TASK_STATUS_PENDING)
             if status == TASK_STATUS_UPLOADED or status == TASK_STATUS_DOWNLOADED:
                 continue
-            update_task_status(log, uri, TASK_STATUS_DOWNLOADING)
-            save_task_log(args.temp_dir, log)
+            thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADING)
+            thread_safe_save_task_log(args.temp_dir, log)
             try:
                 if not (os.path.exists(file_path) and os.path.getsize(file_path) > 0):
                     download_file(uri, args.temp_dir)
-                update_task_status(log, uri, TASK_STATUS_DOWNLOADED)
+                thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADED)
             except Exception as e:
-                update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
-            save_task_log(args.temp_dir, log)
+                thread_safe_update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
+            thread_safe_save_task_log(args.temp_dir, log)
         return
     if args.upload_only:
         # 只上传，更新任务日志
@@ -267,14 +322,14 @@ def main():
                 continue
             if not os.path.exists(file_path):
                 continue
-            update_task_status(log, uri, TASK_STATUS_UPLOADING)
-            save_task_log(args.temp_dir, log)
+            thread_safe_update_task_status(log, uri, TASK_STATUS_UPLOADING)
+            thread_safe_save_task_log(args.temp_dir, log)
             try:
                 push_with_curl(args.registry, file_path, args.username, args.password)
-                update_task_status(log, uri, TASK_STATUS_UPLOADED)
+                thread_safe_update_task_status(log, uri, TASK_STATUS_UPLOADED)
             except Exception as e:
-                update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
-            save_task_log(args.temp_dir, log)
+                thread_safe_update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
+            thread_safe_save_task_log(args.temp_dir, log)
         if args.rewrite_toml:
             rewrite_toml_from_meta(args.buildpack_toml, 'buildpack-modified.toml', args.registry, args.temp_dir)
         return
