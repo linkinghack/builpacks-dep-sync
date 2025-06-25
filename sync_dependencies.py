@@ -201,14 +201,18 @@ def download_worker(entry, temp_dir, log):
     file_path = entry['file_path']
     status = entry.get('status', TASK_STATUS_PENDING)
     if status == TASK_STATUS_UPLOADED or status == TASK_STATUS_DOWNLOADED:
+        print(f"[SKIP] {uri} 已下载或已上传，跳过下载")
         return
+    print(f"[DOWNLOAD-START] {uri} -> {file_path}")
     thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADING)
     thread_safe_save_task_log(temp_dir, log)
     try:
         if not (os.path.exists(file_path) and os.path.getsize(file_path) > 0):
             download_file(uri, temp_dir)
+        print(f"[DOWNLOAD-SUCCESS] {uri} -> {file_path}")
         thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADED)
     except Exception as e:
+        print(f"[DOWNLOAD-FAIL] {uri} : {e}")
         thread_safe_update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
     thread_safe_save_task_log(temp_dir, log)
 
@@ -217,19 +221,25 @@ def upload_worker(entry, registry, username, password, temp_dir, log):
     file_path = entry['file_path']
     status = entry.get('status', TASK_STATUS_DOWNLOADED)
     if status == TASK_STATUS_UPLOADED:
+        print(f"[SKIP] {uri} 已上传，跳过上传")
         return
     if not os.path.exists(file_path):
+        print(f"[SKIP] {uri} 文件不存在，跳过上传")
         return
+    print(f"[UPLOAD-START] {uri} -> {file_path}")
     thread_safe_update_task_status(log, uri, TASK_STATUS_UPLOADING)
     thread_safe_save_task_log(temp_dir, log)
     try:
         push_with_curl(registry, file_path, username, password)
+        print(f"[UPLOAD-SUCCESS] {uri} -> {file_path}")
         thread_safe_update_task_status(log, uri, TASK_STATUS_UPLOADED)
     except Exception as e:
+        print(f"[UPLOAD-FAIL] {uri} : {e}")
         thread_safe_update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
     thread_safe_save_task_log(temp_dir, log)
 
 def download_and_upload_all(deps, temp_dir, registry, username=None, password=None, max_workers=DEFAULT_WORKERS):
+    print(f"[TASK] 启动并发下载和上传，线程数: {max_workers}")
     log = load_task_log(temp_dir)
     if not log:
         log = init_task_log(deps, temp_dir, registry)
@@ -244,31 +254,37 @@ def download_and_upload_all(deps, temp_dir, registry, username=None, password=No
             upload_worker(entry, registry, username, password, temp_dir, log)
             upload_queue.task_done()
     upload_threads = []
-    for _ in range(max_workers):
+    for i in range(max_workers):
         t = threading.Thread(target=upload_consumer)
         t.daemon = True
         t.start()
         upload_threads.append(t)
+        print(f"[THREAD] 启动上传线程 {i+1}")
     # 启动下载线程池，下载完成即入上传队列
     def download_and_enqueue(entry):
         uri = entry['uri']
         file_path = entry['file_path']
         status = entry.get('status', TASK_STATUS_PENDING)
         if status == TASK_STATUS_UPLOADED:
+            print(f"[SKIP] {uri} 已上传，跳过下载")
             return
         if status == TASK_STATUS_DOWNLOADED:
-            # 已下载未上传的，直接入队
+            print(f"[QUEUE] {uri} 已下载未上传，加入上传队列")
             upload_queue.put(entry)
             return
+        print(f"[QUEUE] {uri} 加入下载队列")
         thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADING)
         thread_safe_save_task_log(temp_dir, log)
         try:
             if not (os.path.exists(file_path) and os.path.getsize(file_path) > 0):
                 download_file(uri, temp_dir)
+            print(f"[DOWNLOAD-SUCCESS] {uri} -> {file_path}")
             thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADED)
             thread_safe_save_task_log(temp_dir, log)
+            print(f"[QUEUE] {uri} 下载完成，加入上传队列")
             upload_queue.put(entry)
         except Exception as e:
+            print(f"[DOWNLOAD-FAIL] {uri} : {e}")
             thread_safe_update_task_status(log, uri, TASK_STATUS_FAILED, str(e))
             thread_safe_save_task_log(temp_dir, log)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -276,8 +292,9 @@ def download_and_upload_all(deps, temp_dir, registry, username=None, password=No
                    for entry in log if entry.get('status') not in [TASK_STATUS_UPLOADED]]
         for f in as_completed(futures):
             pass
-    # 等待所有上传完成
+    print("[TASK] 等待所有上传任务完成...")
     upload_queue.join()
+    print("[TASK] 所有上传任务已完成！")
 
 def main():
     args = parse_args()
