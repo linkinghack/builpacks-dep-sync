@@ -203,6 +203,13 @@ def download_worker(entry, temp_dir, log):
     if status == TASK_STATUS_UPLOADED or status == TASK_STATUS_DOWNLOADED:
         print(f"[SKIP] {uri} 已下载或已上传，跳过下载")
         return
+    # downloading 状态时强制删除本地文件
+    if status == TASK_STATUS_DOWNLOADING and os.path.exists(file_path):
+        print(f"[CLEAN] {uri} 上次下载未完成，删除不完整文件 {file_path}")
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            print(f"[WARN] 删除文件失败: {file_path} : {e}")
     print(f"[DOWNLOAD-START] {uri} -> {file_path}")
     thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADING)
     thread_safe_save_task_log(temp_dir, log)
@@ -247,9 +254,9 @@ def download_and_upload_all(deps, temp_dir, registry, username=None, password=No
     # 启动上传线程池
     def upload_consumer():
         while True:
-            try:
-                entry = upload_queue.get(timeout=3)
-            except Empty:
+            entry = upload_queue.get()
+            if entry is None:
+                upload_queue.task_done()
                 break
             upload_worker(entry, registry, username, password, temp_dir, log)
             upload_queue.task_done()
@@ -272,6 +279,13 @@ def download_and_upload_all(deps, temp_dir, registry, username=None, password=No
             print(f"[QUEUE] {uri} 已下载未上传，加入上传队列")
             upload_queue.put(entry)
             return
+        # downloading 状态时强制删除本地文件
+        if status == TASK_STATUS_DOWNLOADING and os.path.exists(file_path):
+            print(f"[CLEAN] {uri} 上次下载未完成，删除不完整文件 {file_path}")
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                print(f"[WARN] 删除文件失败: {file_path} : {e}")
         print(f"[QUEUE] {uri} 加入下载队列")
         thread_safe_update_task_status(log, uri, TASK_STATUS_DOWNLOADING)
         thread_safe_save_task_log(temp_dir, log)
@@ -292,6 +306,9 @@ def download_and_upload_all(deps, temp_dir, registry, username=None, password=No
                    for entry in log if entry.get('status') not in [TASK_STATUS_UPLOADED]]
         for f in as_completed(futures):
             pass
+    print("[TASK] 下载任务全部完成，发送哨兵关闭上传线程...")
+    for _ in range(max_workers):
+        upload_queue.put(None)
     print("[TASK] 等待所有上传任务完成...")
     upload_queue.join()
     print("[TASK] 所有上传任务已完成！")
